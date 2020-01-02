@@ -663,3 +663,24 @@ func PostForm(url string, data url.Values) (*http.Response, error) {
 func (c *Client) PostForm(url string, data url.Values) (*http.Response, error) {
 	return c.Post(url, "application/x-www-form-urlencoded", strings.NewReader(data.Encode()))
 }
+
+func RetryTransport() http.RoundTripper {
+	client := NewClient()
+	client.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+		if err == nil && resp.StatusCode == 429 {
+			return true, nil
+		}
+		return DefaultRetryPolicy(ctx, resp, err)
+	}
+	return &retryableTransport{client}
+}
+type retryableTransport struct {
+	*Client
+}
+func (c *retryableTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	req, err := FromRequest(request)
+	if err != nil {
+		return nil, err
+	}
+	return c.Do(req)
+}
