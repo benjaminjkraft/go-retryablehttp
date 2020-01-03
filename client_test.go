@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -771,5 +774,88 @@ func TestClient_BackoffCustom(t *testing.T) {
 	resp.Body.Close()
 	if retries != int32(client.RetryMax) {
 		t.Fatalf("expected retries: %d != %d", client.RetryMax, retries)
+	}
+}
+
+func incrementCookie(w http.ResponseWriter, r *http.Request) {
+	var count int
+	cookie, err := r.Cookie("count")
+	if err == nil {
+		count, _ = strconv.Atoi(cookie.Value)
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:    "count",
+		Value:   strconv.Itoa(count + 1),
+		Expires: time.Now().Add(time.Hour),
+	})
+
+	w.Header().Add("Set-Cookie", fmt.Sprintf("count=%v", count+1))
+
+	// Amusingly, setting this to 3 breaks both tests: the extant client
+	// apparently uses cookies from the initial request on the retries, but does
+	// not use cookies from one retry on subsequent retries.
+	if count < 1 {
+		w.WriteHeader(http.StatusInternalServerError)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+func NoBackoff(_, _ time.Duration, _ int, _ *http.Response) time.Duration { return 0 }
+
+// Passes: the client persists cookies to from the initial request to the
+// retry.
+func TestClientCookies(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(incrementCookie))
+	defer ts.Close()
+
+	client := NewClient()
+	client.Backoff = NoBackoff
+	jar, err := cookiejar.New(&cookiejar.Options{})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	client.HTTPClient.Jar = jar
+
+	resp, err := client.Get(ts.URL)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %v", resp.Status)
+	}
+}
+
+// Should be semantically equivalent, but fails: cookies are not persisted,
+// because the request never makes it back to the transport until it has
+// succeeded or we've given up retrying.
+//
+// Of course, we could expose a way to set transport.Client.Jar and require
+// that any wrapping client must set it to the same value, but that's messy and
+// this is just one of many similar problems.  (For another, imagine a client
+// whose transport mucks with status codes.)  These are not common issues, but
+// starting from the wrong semantics means there will be no end to them.
+func TestRoundTripperCookies(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(incrementCookie))
+	defer ts.Close()
+
+	transport := RetryTransport(NoBackoff)
+	jar, err := cookiejar.New(&cookiejar.Options{})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	client := http.Client{
+		Transport: transport,
+		Jar:       jar,
+	}
+
+	resp, err := client.Get(ts.URL)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %v", resp.Status)
 	}
 }
